@@ -1,0 +1,32 @@
+[build-system]
+requires      = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name        = "pact-bridge"
+version     = "0.1.0"
+description = "The spinal cord connecting pact (intent translation) and pact-ax (agent collaboration)"
+readme      = "README.md"
+license     = { text = "MIT" }
+requires-python = ">=3.10"
+
+keywords = [
+    "pact", "pact-ax", "multi-agent", "intent-translation",
+    "agent-collaboration", "ai-agents", "neurobloom"
+]
+
+dependencies = []   # zero hard deps — pact and pact-ax are optional
+
+[project.optional-dependencies]
+pact   = ["pact-protocol>=0.1.0"]
+pact_ax = ["pact-ax>=0.1.0"]
+full   = ["pact-protocol>=0.1.0", "pact-ax>=0.1.0", "pyyaml>=6.0"]
+dev    = ["pytest>=7", "pytest-cov", "httpx"]
+
+[project.urls]
+Homepage   = "https://github.com/neurobloomai/pact-bridge"
+Repository = "https://github.com/neurobloomai/pact-bridge"
+Issues     = "https://github.com/neurobloomai/pact-bridge/issues"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
