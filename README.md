@@ -241,6 +241,12 @@ pact-bridge/
 
 ---
 
+## rlp-0 Integration
+See [docs/INTEGRATION_RLP0.md](docs/INTEGRATION_RLP0.md) for wiring rlp-0
+as the shared relational substrate across pact-bridge and pact-hh.
+
+---
+
 ## Related repos
 
 | Repo | Role |
