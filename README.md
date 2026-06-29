@@ -13,12 +13,17 @@ External Platform (Dialogflow / Rasa / custom agent)
     │    └─ pact IntentRegistry  ───► translated intent
     │    └─ AgentRegistry        ───► who can handle?
     │                                 │
+    │  RLPSession (rlp-0)             │
+    │    └─ trust / intent signals ──► relational gate check
+    │    └─ RUPTURE_BLOCKED if gated  │
+    │                                 │
     │  (single agent)                 │
     │    └─ dispatch to best agent    │
     │                                 │
     │  (multi-agent intent)           │
     │    └─ pact-ax ConsensusProtocol │
     │         └─ all candidates vote  │
+    │         └─ consensus ──────────► RLPSession.on_consensus_*
     │                                 │
     │  SessionStore                   │
     │    └─ pact-ax StateTransfer ───► context persisted
@@ -111,13 +116,18 @@ pip install pact-bridge[full]
 ```
 handle(message)
   │
-  ├─ parse()         normalise raw dict → IncomingMessage
-  ├─ trust gate      sender trust_score ≥ config.trust_floor?
-  ├─ translate()     pact IntentRegistry.translate(intent)
-  ├─ candidates()    AgentRegistry.candidates(translated_intent)
-  ├─ single?         dispatch to best-trust agent
-  ├─ multi-agent?    ConsensusProtocol.run(votes from all candidates)
-  └─ adapt()         ResponseAdapter.adapt(result, platform)
+  ├─ parse()              normalise raw dict → IncomingMessage
+  ├─ trust gate           sender trust_score ≥ config.trust_floor?
+  ├─ rlp_session          get/create per-session rlp-0 instance
+  ├─ on_trust_evaluated() map sender trust → rlp-0 relational state
+  ├─ rlp gate check       gate_open()? → RUPTURE_BLOCKED if closed
+  ├─ translate()          pact IntentRegistry.translate(intent)
+  ├─ on_intent_translated() intent confidence → rlp-0 intent signal
+  ├─ candidates()         AgentRegistry.candidates(translated_intent)
+  ├─ single?              dispatch to best-trust agent
+  ├─ multi-agent?         ConsensusProtocol.run(votes from all candidates)
+  │                         → on_consensus_reached/failed() → rlp-0
+  └─ adapt()              ResponseAdapter.adapt(result, platform)
 ```
 
 ### Multi-agent consensus
@@ -131,6 +141,34 @@ BridgeConfig(multi_agent_intents={"approve_refund", "policy_override"})
 All registered agents that handle the intent cast a vote.
 `ConsensusProtocol` (from pact-ax) picks the winner.
 The result includes `consensus.outcome`, `consensus.confidence`, and `consensus.decision`.
+
+### Relational health tracking (rlp-0)
+
+Every session has an `RLPSession` that tracks four relational signals as messages flow through the bridge: trust (from sender trust score), intent (from translation confidence), narrative (from consensus coherence), and commitments. When these signals degrade past a threshold, rlp-0 detects rupture and closes a gate.
+
+```python
+# Gate-closed response when relational health is degraded
+{
+  "status":  "rupture_blocked",
+  "ok":      False,
+  "result":  {
+    "message":      "Relational rupture detected — interaction blocked until repair.",
+    "rupture_risk": 0.73,
+  }
+}
+```
+
+The gate reopens when pact-hh's `DecisionInjector` calls `acknowledge_repair()` after a human approves — but only if the primitives actually improved. No unconditional release.
+
+```python
+# Full repair loop: bridge detects rupture → pact-hh escalates → human approves → gate releases
+bridge = PACTBridge(config=BridgeConfig(rupture_threshold=0.45))
+loop   = HumanEscalationLoop.create(rlp_store=bridge.rlp_store, ...)
+
+# loop.rlp_store IS bridge.rlp_store — the same sessions, the shared ledger
+```
+
+`bridge.rlp_store` is the live `RLPSessionStore`. Pass it to `HumanEscalationLoop` at startup — that's the entire wiring.
 
 ### Session continuity
 
@@ -193,6 +231,7 @@ events back to the bus for full observability.
 | `session_ttl_minutes` | 60 | Idle session lifetime |
 | `multi_agent_intents` | `{}` | Intents requiring consensus |
 | `consensus_strategy` | `weighted_vote` | `weighted_vote` \| `quorum` \| `unanimous` \| `confidence_threshold` |
+| `rupture_threshold` | 0.45 | rlp-0 rupture sensitivity (0–1); higher = gate closes sooner |
 | `enable_gossip` | True | Broadcast intents through gossip layer |
 | `enable_bus` | True | Publish events to CoordinationBus |
 
@@ -211,11 +250,13 @@ PACT_BRIDGE_CONSENSUS=quorum
 ```python
 bridge.health()
 # → {"status": "ok", "live_agents": 3, "active_sessions": 12,
-#    "pact_registry": "connected", "consensus": "ready", ...}
+#    "pact_registry": "connected", "consensus": "ready",
+#    "rlp_sessions": 12, "rlp_gated": 1, "rlp_avg_risk": 0.18}
 
 bridge.metrics()
-# → {"bridge": {"handled": 42, "success": 40, "errors": 2},
-#    "router": {...}, "sessions": {...}, "registry": {...}, "consensus": {...}}
+# → {"bridge": {"handled": 42, "success": 40, "errors": 2, "rupture_blocked": 1},
+#    "router": {...}, "sessions": {...}, "registry": {...}, "consensus": {...},
+#    "rlp": {"active_rlp_sessions": 12, "avg_rupture_risk": 0.18, "gated_sessions": 1}}
 ```
 
 ---
@@ -226,12 +267,15 @@ bridge.metrics()
 pact-bridge/
 ├── pact_bridge/
 │   ├── __init__.py
-│   ├── config.py          BridgeConfig
-│   ├── core.py            PACTBridge (main orchestrator)
-│   ├── agent_registry.py  AgentCard + AgentRegistry
-│   ├── intent_router.py   IntentRouter (pact → pact-ax)
-│   ├── session_store.py   SessionStore + Session
+│   ├── config.py           BridgeConfig
+│   ├── core.py             PACTBridge (main orchestrator)
+│   ├── agent_registry.py   AgentCard + AgentRegistry
+│   ├── intent_router.py    IntentRouter (pact → pact-ax)
+│   ├── rlp_session.py      RLPSession + RLPSessionStore (rlp-0 wiring)
+│   ├── session_store.py    SessionStore + Session
 │   └── response_adapter.py ResponseAdapter + platform adapters
+├── docs/
+│   └── INTEGRATION_RLP0.md full wiring reference
 ├── examples/
 │   └── quickstart.py
 ├── tests/
@@ -241,9 +285,49 @@ pact-bridge/
 
 ---
 
-## rlp-0 Integration
-See [docs/INTEGRATION_RLP0.md](docs/INTEGRATION_RLP0.md) for wiring rlp-0
-as the shared relational substrate across pact-bridge and pact-hh.
+## Wiring with pact-hh (full repair loop)
+
+pact-bridge detects relational rupture. pact-hh escalates to a human. The human's decision releases the gate. One line of wiring connects them:
+
+```python
+from pact_bridge import PACTBridge, BridgeConfig
+from pact_hh import HumanEscalationLoop
+
+bridge = PACTBridge(config=BridgeConfig(rupture_threshold=0.45))
+
+loop = HumanEscalationLoop.create(
+    slack_token      = "xoxb-...",
+    default_human_id = "on-call",
+    rlp_store        = bridge.rlp_store,   # shared relational ledger
+)
+loop.start()
+```
+
+```
+message arrives
+  │
+  ├─ trust too low or prior rupture?
+  │    └─ RUPTURE_BLOCKED ──────────────────────────────────────────────┐
+  │                                                                      │
+  │                                                                      ▼
+  │                                                         loop.escalate(session_id=...)
+  │                                                              │
+  │                                                              ├─ on_escalation_opened()
+  │                                                              │   → rlp-0: stress signal
+  │                                                              │
+  │                                                         human replies "approve"
+  │                                                              │
+  │                                                              ├─ DecisionInjector.inject()
+  │                                                              ├─ RLPAdapter.on_decision()
+  │                                                              └─ acknowledge_repair()
+  │                                                                   → gate releases if
+  │                                                                     risk < threshold
+  │
+  └─ gate open → route normally
+
+```
+
+For the full wiring reference see [docs/INTEGRATION_RLP0.md](docs/INTEGRATION_RLP0.md).
 
 ---
 
