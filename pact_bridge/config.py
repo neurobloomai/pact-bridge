@@ -96,6 +96,7 @@ class BridgeConfig:
     enable_bus:            bool            = True
     platform_adapters:     dict            = field(default_factory=dict)
     log_level:             str             = "INFO"
+    rupture_threshold:     float           = 0.45
 
     @classmethod
     def from_env(cls) -> "BridgeConfig":

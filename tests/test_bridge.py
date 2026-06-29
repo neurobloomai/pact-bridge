@@ -290,27 +290,27 @@ class TestSessionStore:
 class TestPACTBridge:
     def test_successful_route(self):
         bridge = make_bridge()
-        resp = bridge.handle({"sender_id": "u", "platform": "rasa",
+        resp = bridge.handle({"sender_id": "u", "platform": "custom",
                               "intent": "billing.lookup"})
         assert resp["ok"] is True
 
     def test_no_agent_response(self):
         bridge = make_bridge()
-        resp = bridge.handle({"sender_id": "u", "platform": "rasa",
+        resp = bridge.handle({"sender_id": "u", "platform": "custom",
                               "intent": "completely.unknown.intent"})
         assert resp["ok"] is False
 
     def test_untrusted_sender_blocked(self):
         bridge = make_bridge(trust_floor=0.8)
-        resp = bridge.handle({"sender_id": "u", "platform": "rasa",
+        resp = bridge.handle({"sender_id": "u", "platform": "custom",
                               "intent": "billing.lookup", "trust_score": 0.2})
         assert resp["ok"] is False
 
     def test_session_preserved_across_turns(self):
         bridge = make_bridge()
-        r1 = bridge.handle({"sender_id": "u", "platform": "rasa",
+        r1 = bridge.handle({"sender_id": "u", "platform": "custom",
                             "intent": "billing.lookup", "session_id": "s99"})
-        r2 = bridge.handle({"sender_id": "u", "platform": "rasa",
+        r2 = bridge.handle({"sender_id": "u", "platform": "custom",
                             "intent": "billing.dispute", "session_id": "s99"})
         assert r1["ok"] and r2["ok"]
 
@@ -324,21 +324,24 @@ class TestPACTBridge:
         bridge = make_bridge()
         resp = bridge.handle({"sender_id": "u", "platform": "rasa",
                               "intent": "billing.lookup"})
-        assert "ok" in resp     # CustomAdapter or RasaAdapter depending on platform
+        assert "responses" in resp and "events" in resp
 
     def test_metrics_structure(self):
         bridge = make_bridge()
-        bridge.handle({"sender_id": "u", "platform": "rasa", "intent": "billing.lookup"})
+        bridge.handle({"sender_id": "u", "platform": "custom", "intent": "billing.lookup"})
         m = bridge.metrics()
         assert m["bridge"]["handled"] >= 1
         assert "sessions" in m
         assert "registry" in m
+        assert "rlp" in m
+        assert "active_rlp_sessions" in m["rlp"]
 
     def test_health_keys(self):
         bridge = make_bridge()
         h = bridge.health()
         for k in ("status", "live_agents", "active_sessions",
-                  "pact_registry", "coordination_bus"):
+                  "pact_registry", "coordination_bus",
+                  "rlp_sessions", "rlp_gated", "rlp_avg_risk"):
             assert k in h
 
     def test_register_handler(self):
@@ -357,3 +360,122 @@ class TestPACTBridge:
     def test_repr(self):
         bridge = make_bridge()
         assert "PACTBridge" in repr(bridge)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# RLP-0 integration tests
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestRLPIntegration:
+    """Tests for rlp-0 relational state tracking wired into PACTBridge."""
+
+    def test_rlp_store_created_on_init(self):
+        bridge = make_bridge()
+        assert bridge.rlp_store is not None
+
+    def test_rlp_session_created_on_first_handle(self):
+        bridge = make_bridge()
+        assert bridge.rlp_store.metrics()["active_rlp_sessions"] == 0
+        bridge.handle({"sender_id": "u", "platform": "custom", "intent": "billing.lookup"})
+        assert bridge.rlp_store.metrics()["active_rlp_sessions"] == 1
+
+    def test_rlp_session_reused_across_turns(self):
+        bridge = make_bridge()
+        bridge.handle({"sender_id": "u", "platform": "custom",
+                       "intent": "billing.lookup", "session_id": "sess-1"})
+        bridge.handle({"sender_id": "u", "platform": "custom",
+                       "intent": "billing.dispute", "session_id": "sess-1"})
+        # Same session → still 1 rlp session, not 2
+        assert bridge.rlp_store.metrics()["active_rlp_sessions"] == 1
+
+    def test_rlp_separate_sessions_per_session_id(self):
+        bridge = make_bridge()
+        bridge.handle({"sender_id": "u", "platform": "custom",
+                       "intent": "billing.lookup", "session_id": "sess-a"})
+        bridge.handle({"sender_id": "u", "platform": "custom",
+                       "intent": "billing.dispute", "session_id": "sess-b"})
+        assert bridge.rlp_store.metrics()["active_rlp_sessions"] == 2
+
+    def test_high_trust_does_not_close_gate(self):
+        bridge = make_bridge()
+        # High trust sender — gate should stay open
+        resp = bridge.handle({
+            "sender_id": "u", "platform": "custom",
+            "intent": "billing.lookup", "trust_score": 0.95,
+        })
+        assert resp["status"] != "rupture_blocked"
+        assert resp["ok"] is True
+
+    def test_rupture_blocked_status_when_gate_closed(self):
+        from pact_bridge import RLPSessionStore, BridgeStatus
+        bridge = make_bridge()
+
+        # Manually force gate closed by injecting a pre-ruptured RLP session
+        session_id = "forced-rupture-session"
+
+        # Create a session and drive it to rupture
+        rlp_session = bridge.rlp_store.get_or_create(session_id=session_id)
+        if rlp_session._available:
+            # Drive primitives to rupture state
+            rlp_session._rlp.update_state(trust=0.05, intent=0.05, narrative=0.05, commitments=0.05)
+            assert not rlp_session.gate_open(), "gate should be closed after rupture"
+
+            # Handle a message on this pre-ruptured session
+            resp = bridge.handle({
+                "sender_id": "u", "platform": "custom",
+                "intent": "billing.lookup", "session_id": session_id,
+                "trust_score": 0.9,
+            })
+            assert resp["status"] == BridgeStatus.RUPTURE_BLOCKED.value
+            assert resp["ok"] is False
+            assert "rupture" in resp["result"]["message"].lower()
+        else:
+            # rlp-0 not installed — gate is always open, no blocking
+            assert True, "rlp-0 not installed, passthrough mode"
+
+    def test_rupture_blocked_counted_in_metrics(self):
+        bridge = make_bridge()
+        session_id = "metric-test-session"
+        rlp_session = bridge.rlp_store.get_or_create(session_id=session_id)
+        if rlp_session._available:
+            rlp_session._rlp.update_state(trust=0.05, intent=0.05, narrative=0.05, commitments=0.05)
+            bridge.handle({
+                "sender_id": "u", "platform": "custom",
+                "intent": "billing.lookup", "session_id": session_id,
+                "trust_score": 0.9,
+            })
+            assert bridge._metrics["rupture_blocked"] == 1
+
+    def test_rlp_metrics_in_bridge_metrics(self):
+        bridge = make_bridge()
+        bridge.handle({"sender_id": "u", "platform": "custom", "intent": "billing.lookup"})
+        m = bridge.metrics()
+        assert "rlp" in m
+        rlp = m["rlp"]
+        assert "active_rlp_sessions" in rlp
+        assert "avg_rupture_risk" in rlp
+        assert rlp["active_rlp_sessions"] >= 1
+
+    def test_rlp_health_fields(self):
+        bridge = make_bridge()
+        bridge.handle({"sender_id": "u", "platform": "custom", "intent": "billing.lookup"})
+        h = bridge.health()
+        assert "rlp_sessions" in h
+        assert "rlp_gated" in h
+        assert "rlp_avg_risk" in h
+        assert h["rlp_sessions"] >= 1
+        assert h["rlp_avg_risk"] >= 0.0
+
+    def test_custom_rupture_threshold_config(self):
+        bridge = PACTBridge(config=BridgeConfig(rupture_threshold=0.3))
+        assert bridge.rlp_store.rupture_threshold == 0.3
+
+    def test_rlp_session_status_accessible(self):
+        bridge = make_bridge()
+        bridge.handle({"sender_id": "u", "platform": "custom",
+                       "intent": "billing.lookup", "session_id": "status-test"})
+        session = bridge.rlp_store.get("status-test")
+        assert session is not None
+        status = session.status()
+        assert "session_id" in status
+        assert "rlp0_available" in status

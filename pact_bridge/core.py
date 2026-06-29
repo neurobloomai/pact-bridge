@@ -64,6 +64,7 @@ from pact_bridge.agent_registry import AgentCard, AgentRegistry
 from pact_bridge.config import BridgeConfig
 from pact_bridge.intent_router import IncomingMessage, IntentRouter, RoutingOutcome
 from pact_bridge.response_adapter import BridgeResponse, BridgeStatus, ResponseAdapter
+from pact_bridge.rlp_session import RLPSessionStore
 from pact_bridge.session_store import SessionStore
 
 logger = logging.getLogger(__name__)
@@ -111,6 +112,7 @@ class PACTBridge:
             ttl_minutes              = self.config.session_ttl_minutes,
             transfer_manager_factory = self._make_transfer_manager,
         )
+        self.rlp_store      = RLPSessionStore(rupture_threshold=self.config.rupture_threshold)
         self._adapter       = ResponseAdapter()
         self._trust_net     = trust_network
         self._bus           = bus
@@ -118,7 +120,7 @@ class PACTBridge:
         self._consensus_proto = self._build_consensus()
         self._metrics: Dict[str, int] = {
             "handled": 0, "success": 0, "errors": 0,
-            "consensus_rounds": 0,
+            "consensus_rounds": 0, "rupture_blocked": 0,
         }
 
         if bus is not None:
@@ -215,8 +217,17 @@ class PACTBridge:
             session_id = incoming.session_id,
         )
 
+        # ── RLP-0 relational session ─────────────────────────────────────────
+        rlp_session = self.rlp_store.get_or_create(
+            session_id = session.session_id,
+            bus        = self._bus,
+        )
+
         # ── Route ────────────────────────────────────────────────────────────
         decision = self._router.route(incoming)
+
+        # Map sender trust into rlp-0 — every message updates relational state
+        rlp_session.on_trust_evaluated(incoming.trust_score)
 
         self._emit("bridge.routed", incoming.sender_id, decision.to_dict())
 
@@ -250,9 +261,34 @@ class PACTBridge:
                 session_id      = session.session_id,
             )
 
+        # Intent was translated — signal that shared intent is clear
+        if decision.translated_intent != incoming.intent:
+            rlp_session.on_intent_translated(confidence=1.0)
+
+        # ── Relational gate check ────────────────────────────────────────────
+        # rlp-0 may have closed the gate from accumulated rupture across turns
+        if not rlp_session.gate_open():
+            self._metrics["rupture_blocked"] += 1
+            logger.warning(
+                "RLP gate closed for session %s (risk=%.2f) — blocking routing",
+                session.session_id, rlp_session.rupture_risk(),
+            )
+            return BridgeResponse(
+                status          = BridgeStatus.RUPTURE_BLOCKED,
+                intent          = decision.translated_intent,
+                original_intent = incoming.intent,
+                agent_id        = None,
+                result          = {
+                    "message":      "Relational rupture detected — interaction blocked until repair.",
+                    "rupture_risk": rlp_session.rupture_risk(),
+                },
+                session_id      = session.session_id,
+                warnings        = [f"rlp-0 gate closed; rupture_risk={rlp_session.rupture_risk():.2f}"],
+            )
+
         # ── Multi-agent consensus ────────────────────────────────────────────
         if decision.needs_consensus:
-            return self._run_consensus(incoming, session, decision)
+            return self._run_consensus(incoming, session, decision, rlp_session)
 
         # ── Single agent dispatch ────────────────────────────────────────────
         agent   = decision.primary_agent
@@ -276,7 +312,7 @@ class PACTBridge:
             session_id      = session.session_id,
         )
 
-    def _run_consensus(self, incoming, session, decision) -> BridgeResponse:
+    def _run_consensus(self, incoming, session, decision, rlp_session=None) -> BridgeResponse:
         """Collect votes from all candidate agents and run ConsensusProtocol."""
         if self._consensus_proto is None:
             logger.error("Multi-agent intent but no ConsensusProtocol configured.")
@@ -333,6 +369,12 @@ class PACTBridge:
             "pact-bridge",
             consensus.to_dict(),
         )
+
+        if rlp_session is not None:
+            if consensus.reached:
+                rlp_session.on_consensus_reached(confidence=consensus.confidence_score)
+            else:
+                rlp_session.on_consensus_failed(agent_count=len(votes))
 
         if not consensus.reached:
             return BridgeResponse(
@@ -509,9 +551,11 @@ class PACTBridge:
                 self._consensus_proto.metrics()
                 if self._consensus_proto else None
             ),
+            "rlp":       self.rlp_store.metrics(),
         }
 
     def health(self) -> Dict[str, Any]:
+        rlp_metrics = self.rlp_store.metrics()
         return {
             "status":            "ok",
             "live_agents":       len(self.registry),
@@ -520,6 +564,9 @@ class PACTBridge:
             "trust_network":     "connected" if self._trust_net else "not connected",
             "coordination_bus":  "connected" if self._bus else "not connected",
             "consensus":         "ready" if self._consensus_proto else "unavailable",
+            "rlp_sessions":      rlp_metrics["active_rlp_sessions"],
+            "rlp_gated":         rlp_metrics.get("gated_sessions", 0),
+            "rlp_avg_risk":      rlp_metrics["avg_rupture_risk"],
         }
 
     def __repr__(self) -> str:

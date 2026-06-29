@@ -34,11 +34,12 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────────────────────
 
 class BridgeStatus(str, Enum):
-    SUCCESS       = "success"
-    NO_AGENT      = "no_agent"
-    UNTRUSTED     = "untrusted"
-    CONSENSUS_FAIL = "consensus_fail"
-    ERROR         = "error"
+    SUCCESS          = "success"
+    NO_AGENT         = "no_agent"
+    UNTRUSTED        = "untrusted"
+    CONSENSUS_FAIL   = "consensus_fail"
+    RUPTURE_BLOCKED  = "rupture_blocked"
+    ERROR            = "error"
 
 
 @dataclass
